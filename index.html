@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ZDL 3D Viewer</title>
+  <style>
+    html, body { height: 100%; margin: 0; overflow: hidden; background: #000; }
+    canvas { display: block; }
+
+    #hud {
+      position: fixed; inset: 0;
+      display: grid; place-items: center;
+      font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: #fff;
+      pointer-events: none;
+    }
+    #panel {
+      pointer-events: auto;
+      background: rgba(0,0,0,.55);
+      border: 1px solid rgba(255,255,255,.15);
+      border-radius: 12px;
+      padding: 14px 16px;
+      max-width: 680px;
+      box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    }
+    #panel code { background: rgba(255,255,255,.1); padding: 0 6px; border-radius: 6px; }
+    .row { display:flex; gap:10px; flex-wrap: wrap; margin-top: 10px; }
+
+    button {
+      margin-top: 10px;
+      appearance: none;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: #fff;
+      color: #000;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: rgba(255,255,255,.15);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,.2);
+    }
+    button:active { transform: translateY(1px); }
+
+    #crosshair {
+      position: fixed; left: 50%; top: 50%;
+      width: 12px; height: 12px;
+      margin-left: -6px; margin-top: -6px;
+      opacity: .8;
+      pointer-events: none;
+    }
+    #crosshair:before, #crosshair:after {
+      content: "";
+      position: absolute; left: 50%; top: 50%;
+      background: rgba(255,255,255,.85);
+      transform: translate(-50%,-50%);
+      border-radius: 2px;
+    }
+    #crosshair:before { width: 12px; height: 2px; }
+    #crosshair:after { width: 2px; height: 12px; }
+
+    #status {
+      position: fixed; left: 12px; bottom: 12px;
+      color: rgba(255,255,255,.8);
+      font: 12px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background: rgba(0,0,0,.35);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 10px;
+      padding: 8px 10px;
+      max-width: 80vw;
+      white-space: pre-line;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.158.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.158.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div id="hud">
+    <div id="panel">
+      <div style="font-size:16px; margin-bottom:6px;"><b>ZDL 3D Viewer</b></div>
+      <div>
+        <b>Walk</b> → Maus-Lock. <code>WASD</code> laufen, <code>Shift</code> sprinten,
+        <code>Space</code> springen, <code>Strg</code> ducken, <code>Esc</code> zurück zum Viewer.<br>
+        <b>Viewer</b> → <code>LMB</code> Orbit, <code>Mausrad</code> Zoom, <code>RMB</code> Pan,
+        <code>WASD</code> = Pan (Shift schneller).
+      </div>
+
+      <div class="row">
+        <button id="btnWalk">Walk</button>
+        <button id="btnView" class="secondary">Viewer</button>
+      </div>
+
+      <div style="opacity:.75; margin-top:8px;">
+        Hotkeys: <code>F</code> Walk, <code>V</code> Viewer
+      </div>
+    </div>
+  </div>
+
+  <div id="crosshair" hidden></div>
+  <div id="status">Lade…</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const MODEL_URL = './ZDL-model.glb';
+
+// Player feel
+const STAND_HEIGHT = 1.7;
+const GRAVITY = 18;            // m/s^2
+const JUMP_VELOCITY = 6.5;
+const WALK_SPEED = 3.5;
+const SPRINT_MULT = 1.8;
+const CROUCH_HEIGHT = 1.0;
+const CROUCH_SPEED_MULT = 0.5;
+const CROUCH_LERP_SPEED = 10;
+
+// Viewer WASD Pan
+const VIEW_PAN_SPEED = 4.0;   // Grundgeschwindigkeit
+const VIEW_PAN_SHIFT_MULT = 2.0;
+
+// “Fail-safe”
+const FALL_RESET_Y = -50;
+
+const statusEl = document.getElementById('status');
+const hudEl = document.getElementById('hud');
+const crosshairEl = document.getElementById('crosshair');
+const btnWalk = document.getElementById('btnWalk');
+const btnView = document.getElementById('btnView');
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+// Szene
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.05, 2000);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// Licht
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0));
+const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+dir.position.set(10, 15, 8);
+scene.add(dir);
+
+// Controls
+const fpsControls = new PointerLockControls(camera, document.body);
+const orbitControls = new OrbitControls(camera, renderer.domElement);
+orbitControls.enableDamping = true;
+orbitControls.dampingFactor = 0.08;
+orbitControls.enablePan = true;
+orbitControls.enableZoom = true;
+orbitControls.minDistance = -3000;
+orbitControls.enableRotate = true;
+
+
+// RMB-Pan ohne Browser-Menü
+addEventListener('contextmenu', (e) => e.preventDefault());
+
+// Mode
+const MODE = { WALK: 'walk', VIEW: 'view' };
+let mode = MODE.VIEW;
+
+// HUD soll nach erster Wahl verschwinden
+let hasChosenMode = false;
+
+// Input
+const keys = new Set();
+addEventListener('keydown', (e) => {
+  keys.add(e.code);
+
+  // Hotkeys
+  if (e.code === 'KeyF') setMode(MODE.WALK);
+  if (e.code === 'KeyV') setMode(MODE.VIEW);
+});
+addEventListener('keyup', (e) => keys.delete(e.code));
+
+// Player state
+const velocity = new THREE.Vector3();
+let onGround = false;
+let currentHeight = STAND_HEIGHT;
+let targetHeight = STAND_HEIGHT;
+let isCrouching = false;
+
+// Ground collision (alle "ground" Meshes)
+let groundMeshes = [];
+const downRay = new THREE.Raycaster();
+
+// Spawn/Reset
+const spawnPos = new THREE.Vector3(0, currentHeight + 1, 5);
+
+// Optional: Viewer-Start (wird nach Load sinnvoll gesetzt)
+let viewerReady = false;
+
+// --- Pose speichern/restore für "exakt gleiche Pose"
+const savedPose = {
+  camPos: new THREE.Vector3(),
+  lookDir: new THREE.Vector3(0, 0, -1),
+  orbitTarget: new THREE.Vector3(),
+  orbitDist: 10,
+};
+
+function saveCameraPose() {
+  savedPose.camPos.copy(camera.position);
+
+  // Blickrichtung speichern (WELT)
+  camera.getWorldDirection(savedPose.lookDir).normalize();
+
+  // Orbit target + Dist merken (falls wir schon im Viewer sind)
+  savedPose.orbitTarget.copy(orbitControls.target);
+  savedPose.orbitDist = Math.max(0.001, camera.position.distanceTo(orbitControls.target));
+}
+
+function restoreCameraPoseForViewer() {
+  // Viewer: Position setzen
+  camera.position.copy(savedPose.camPos);
+
+  // Target aus Blickrichtung rekonstruieren, damit Orbit sauber "einrastet"
+  const target = new THREE.Vector3()
+    .copy(savedPose.camPos)
+    .addScaledVector(savedPose.lookDir, savedPose.orbitDist);
+
+  orbitControls.target.copy(target);
+
+  camera.lookAt(orbitControls.target);
+  orbitControls.update();
+}
+
+// --- Viewer WASD Pan (Kamera + Target zusammen verschieben)
+function viewerWASDPan(dt) {
+
+  const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+  const strafe  = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+
+  // Vertikal
+  const up = (keys.has('Space') ? 1 : 0) - 
+             ((keys.has('ShiftLeft') || keys.has('ShiftRight')) ? 1 : 0);
+
+  if (!forward && !strafe && !up) return;
+
+  const camForward = new THREE.Vector3();
+  camera.getWorldDirection(camForward);
+  camForward.y = 0;
+  if (camForward.lengthSq() < 1e-8) return;
+  camForward.normalize();
+
+  const camRight = new THREE.Vector3()
+    .crossVectors(camForward, new THREE.Vector3(0,1,0))
+    .normalize();
+
+  const move = new THREE.Vector3();
+
+  // Horizontal (WASD)
+  move.addScaledVector(camForward, forward);
+  move.addScaledVector(camRight, strafe);
+
+  // Vertikal (Space / Shift)
+  move.y += up;
+
+  if (move.lengthSq() < 1e-8) return;
+  move.normalize();
+
+  const speedMul =
+    (keys.has('ControlLeft') || keys.has('ControlRight')) ? 2.0 : 1.0;
+
+  move.multiplyScalar(VIEW_PAN_SPEED * speedMul * dt);
+
+  camera.position.add(move);
+  orbitControls.target.add(move);
+}
+
+function getGroundHit() {
+  if (!groundMeshes.length) return null;
+
+  const origin = fpsControls.getObject().position.clone();
+  origin.y += 0.1;
+
+  downRay.far = currentHeight + 1.0;
+  downRay.set(origin, new THREE.Vector3(0, -1, 0));
+
+  const hits = downRay.intersectObjects(groundMeshes, true);
+  return hits.length ? hits[0] : null;
+}
+
+function snapToGround() {
+  const hit = getGroundHit();
+  if (!hit) return false;
+
+  fpsControls.getObject().position.y = hit.point.y + currentHeight;
+  velocity.y = 0;
+  onGround = true;
+  return true;
+}
+
+function resetToSpawn(reason = '') {
+  fpsControls.getObject().position.copy(spawnPos);
+  velocity.set(0,0,0);
+  onGround = false;
+  snapToGround();
+  if (reason) setStatus(reason);
+}
+
+function setMode(newMode) {
+  // vor dem Wechsel Pose merken (damit es NICHT springt)
+  saveCameraPose();
+
+  mode = newMode;
+
+  // nach der ersten Wahl: HUD komplett weg
+  if (!hasChosenMode) {
+    hasChosenMode = true;
+    hudEl.style.display = 'none';
+  }
+
+  if (mode === MODE.WALK) {
+    orbitControls.enabled = false;
+
+    crosshairEl.hidden = false;
+
+    // Pointer lock starten
+    fpsControls.lock();
+
+    btnWalk.classList.remove('secondary');
+    btnView.classList.add('secondary');
+  } else {
+    // raus aus pointer lock
+    fpsControls.unlock();
+
+    orbitControls.enabled = true;
+
+    crosshairEl.hidden = true;
+
+    btnView.classList.remove('secondary');
+    btnWalk.classList.add('secondary');
+
+    if (viewerReady) orbitControls.update();
+  }
+
+  // Pose exakt wiederherstellen
+  if (mode === MODE.VIEW) {
+    restoreCameraPoseForViewer();
+  }
+}
+
+// Wenn User ESC drückt -> unlock -> zurück in Viewer
+fpsControls.addEventListener('unlock', () => {
+  if (mode === MODE.WALK) setMode(MODE.VIEW);
+});
+
+// Buttons
+btnWalk.addEventListener('click', () => setMode(MODE.WALK));
+btnView.addEventListener('click', () => setMode(MODE.VIEW));
+
+// Load model
+setStatus('Lade Modell…');
+const loader = new GLTFLoader();
+loader.load(
+  MODEL_URL,
+  (gltf) => {
+    const root = gltf.scene;
+    scene.add(root);
+
+    const box = new THREE.Box3().setFromObject(root);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+
+    box.getSize(size);
+    box.getCenter(center);
+
+    root.position.x -= center.x;
+    root.position.z -= center.z;
+
+    root.position.y -= box.min.y;
+
+    box.setFromObject(root);
+    box.getSize(size);
+    box.getCenter(center);
+
+    groundMeshes.length = 0;
+    root.traverse((o) => {
+    if (!o.isMesh) return;
+    const n = (o.name || '').toLowerCase();
+    if (n.includes('ground')) groundMeshes.push(o);
+    });
+
+    orbitControls.target.copy(center);
+    orbitControls.update();
+    viewerReady = true;
+
+    spawnPos.set(
+    3,                // Mitte X
+    13, 
+    3     // etwas vor dem Modell
+    );
+
+    // Start-Richtung im Walk-Modus
+    fpsControls.getObject().rotation.y = THREE.MathUtils.degToRad(180);
+
+    // FPS Objekt positionieren
+    resetToSpawn(
+    `Bereit.\nGround-Meshes: ${groundMeshes.length}\n` +
+    `Modus: Viewer (V) | Walk (F)`
+    );
+
+    // Pose speichern für Mode-Switch
+    saveCameraPose();
+
+    // Stelle sicher, dass FPS-Objekt auch am Spawn ist
+    resetToSpawn(
+      `Bereit.\nGround-Meshes: ${groundMeshes.length}\n` +
+      `Modus: Viewer (V) | Walk (F)`
+    );
+
+    // Standard: Viewer (HUD bleibt erstmal sichtbar bis zur ersten Wahl)
+    mode = MODE.VIEW;
+    orbitControls.enabled = true;
+    crosshairEl.hidden = true;
+  },
+  (xhr) => {
+    if (xhr.total) setStatus(`Lade Modell… ${Math.round((xhr.loaded/xhr.total)*100)}%`);
+  },
+  (err) => {
+    console.error(err);
+    setStatus('Fehler beim Laden von ' + MODEL_URL + ' (siehe Console).');
+  }
+);
+
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  if (mode === MODE.WALK && fpsControls.isLocked) {
+    const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
+    const strafe  = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
+
+    const sprint = keys.has('ShiftLeft') || keys.has('ShiftRight');
+    isCrouching = keys.has('ControlLeft') || keys.has('ControlRight');
+    targetHeight = isCrouching ? CROUCH_HEIGHT : STAND_HEIGHT;
+
+    let speed = WALK_SPEED * (sprint ? SPRINT_MULT : 1);
+    if (isCrouching) speed *= CROUCH_SPEED_MULT;
+
+    const dirLocal = new THREE.Vector3(strafe, 0, forward);
+    if (dirLocal.lengthSq() > 0) dirLocal.normalize();
+
+    const yawObj = fpsControls.getObject();
+
+    const fwd = new THREE.Vector3();
+    yawObj.getWorldDirection(fwd);
+    fwd.y = 0;
+    fwd.normalize();
+
+    const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0,1,0)).normalize();
+
+    const move = new THREE.Vector3();
+    move.addScaledVector(fwd, dirLocal.z);
+    move.addScaledVector(right, dirLocal.x);
+    move.multiplyScalar(speed);
+
+    yawObj.position.x += move.x * dt;
+    yawObj.position.z += move.z * dt;
+
+    // Jump
+    if (keys.has('Space') && onGround) {
+      velocity.y = JUMP_VELOCITY;
+      onGround = false;
+    }
+
+    // Gravity
+    velocity.y -= GRAVITY * dt;
+    yawObj.position.y += velocity.y * dt;
+
+    // Smooth crouch height interpolation
+    currentHeight += (targetHeight - currentHeight) * Math.min(1, CROUCH_LERP_SPEED * dt);
+
+    // Ground collision
+    if (groundMeshes.length) {
+      const hit = getGroundHit();
+      if (hit) {
+        const groundY = hit.point.y;
+        const feetY = yawObj.position.y - currentHeight;
+
+        if (feetY <= groundY + 0.02) {
+          yawObj.position.y = groundY + currentHeight;
+          velocity.y = 0;
+          onGround = true;
+        } else {
+          onGround = false;
+        }
+      } else {
+        onGround = false;
+      }
+    }
+
+    if (yawObj.position.y < FALL_RESET_Y) {
+      resetToSpawn('Du bist runtergefallen → Respawn.');
+    }
+
+    statusEl.textContent =
+      `Walk | WASD | Space | Shift | Strg | Esc -> Viewer\n` +
+      `Boden: ${groundMeshes.length ? groundMeshes.length + ' Mesh(es)' : 'NICHT gefunden'} | ` +
+      `${onGround ? 'am Boden' : 'in der Luft'}`;
+  } else {
+    // Viewer Mode: WASD Pan + Orbit damping tick
+    if (orbitControls.enabled) {
+      viewerWASDPan(dt);
+      orbitControls.update();
+    }
+
+    statusEl.textContent =
+      `Viewer | LMB Orbit | RMB Pan | Wheel Zoom | WASD Pan\n` +
+      `Modell: ${MODEL_URL.replace('./','')}\n` +
+      `Hotkeys: F Walk | V Viewer`;
+  }
+
+  renderer.render(scene, camera);
+}
+
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
